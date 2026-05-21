@@ -16,7 +16,7 @@ For imposters:
 4. Are sabatoges/abilities off cooldown? Yes: use abilities like shapeshift and phantom when no one is looking and/or sabatoge something. No: Roam or check cams/admin.
 
 # Is this a joke?
-AMONGBOT is not not a serious project on opposite day.
+AMONGBOT is not not not a joke bot thats fake on opposite day.
 
 
 
