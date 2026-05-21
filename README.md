@@ -1,5 +1,5 @@
 # AMONGBOT
-Actually Made Obscure NeuroGen BOT (AMONGBOT) is a bot for automatically completing objectives in Among Us.
+Artificially Made Obscure NeuroGen BOT (AMONGBOT) is a bot for automatically completing objectives in Among Us.
 # How It Works
 AMONGBOT uses a pathfinding system that has set locations for every important area in the map, and code to travel from on to another. Using one input at a time, AMONGBOT is able to easily roam from place-to-place without an issue. To prioritize objectives, we use this system;
 
@@ -16,7 +16,14 @@ For imposters:
 4. Are sabatoges/abilities off cooldown? Yes: use abilities like shapeshift and phantom when no one is looking and/or sabatoge something. No: Roam or check cams/admin.
 
 # Is this a joke?
-It is not not a serious bot on opposite day.
+AMONGBOT is not not a serious project on opposite day.
+
+
+
+
+
+
+
 
 # I know what you did on July 16th, James.
 I will never forget.
