@@ -1,0 +1,687 @@
+import math
+import time
+import hashlib
+import colorsys
+from typing import Optional, Union
+from dataclasses import dataclass, field
+from enum import Enum, auto
+
+
+# ── constants ────────────────────────────────────────────────────────────────
+
+SCREEN_DPI            = 96
+SUBPIXEL_PRECISION    = 4
+COLOR_SAMPLE_RADIUS   = 3
+OCR_CONFIDENCE_FLOOR  = 0.61
+LAYOUT_SNAP_THRESHOLD = 6          # px
+REGION_PADDING        = 2
+MAX_SCAN_ROWS         = 8192
+REPORT_INDENT         = "    "
+_SENTINEL             = object()
+
+
+# ── enums ────────────────────────────────────────────────────────────────────
+
+class Axis(Enum):
+    HORIZONTAL = auto()
+    VERTICAL   = auto()
+    BOTH       = auto()
+
+class AnchorPoint(Enum):
+    TOP_LEFT     = auto()
+    TOP_CENTER   = auto()
+    TOP_RIGHT    = auto()
+    MID_LEFT     = auto()
+    CENTER       = auto()
+    MID_RIGHT    = auto()
+    BOT_LEFT     = auto()
+    BOT_CENTER   = auto()
+    BOT_RIGHT    = auto()
+
+class ElementRole(Enum):
+    UNKNOWN   = "unknown"
+    BUTTON    = "button"
+    LABEL     = "label"
+    INPUT     = "input"
+    CHECKBOX  = "checkbox"
+    DROPDOWN  = "dropdown"
+    TABLE     = "table"
+    IMAGE     = "image"
+    CONTAINER = "container"
+    SCROLLBAR = "scrollbar"
+
+class ScanMode(Enum):
+    FAST    = "fast"       # row-skip=4
+    NORMAL  = "normal"     # row-skip=1
+    PRECISE = "precise"    # subpixel interpolation
+
+
+# ── primitives ───────────────────────────────────────────────────────────────
+
+@dataclass
+class Point:
+    x: float
+    y: float
+
+    def distance_to(self, other: "Point") -> float:
+        return math.hypot(self.x - other.x, self.y - other.y)
+
+    def offset(self, dx: float, dy: float) -> "Point":
+        return Point(self.x + dx, self.y + dy)
+
+    def snap_to_grid(self, grid: int = LAYOUT_SNAP_THRESHOLD) -> "Point":
+        return Point(round(self.x / grid) * grid, round(self.y / grid) * grid)
+
+    def to_tuple(self):
+        return (self.x, self.y)
+
+    def __repr__(self):
+        return f"Point({self.x:.1f}, {self.y:.1f})"
+
+
+@dataclass
+class Rect:
+    x: float
+    y: float
+    width: float
+    height: float
+
+    @property
+    def x2(self) -> float: return self.x + self.width
+    @property
+    def y2(self) -> float: return self.y + self.height
+    @property
+    def cx(self) -> float: return self.x + self.width  / 2
+    @property
+    def cy(self) -> float: return self.y + self.height / 2
+    @property
+    def area(self) -> float: return self.width * self.height
+    @property
+    def aspect_ratio(self) -> float:
+        return self.width / self.height if self.height else 0.0
+
+    def anchor(self, point: AnchorPoint) -> Point:
+        table = {
+            AnchorPoint.TOP_LEFT:   (self.x,  self.y),
+            AnchorPoint.TOP_CENTER: (self.cx, self.y),
+            AnchorPoint.TOP_RIGHT:  (self.x2, self.y),
+            AnchorPoint.MID_LEFT:   (self.x,  self.cy),
+            AnchorPoint.CENTER:     (self.cx, self.cy),
+            AnchorPoint.MID_RIGHT:  (self.x2, self.cy),
+            AnchorPoint.BOT_LEFT:   (self.x,  self.y2),
+            AnchorPoint.BOT_CENTER: (self.cx, self.y2),
+            AnchorPoint.BOT_RIGHT:  (self.x2, self.y2),
+        }
+        x, y = table[point]
+        return Point(x, y)
+
+    def padded(self, amount: float) -> "Rect":
+        return Rect(self.x - amount, self.y - amount,
+                    self.width + amount * 2, self.height + amount * 2)
+
+    def intersects(self, other: "Rect") -> bool:
+        return (self.x < other.x2 and self.x2 > other.x and
+                self.y < other.y2 and self.y2 > other.y)
+
+    def contains_point(self, p: Point) -> bool:
+        return self.x <= p.x <= self.x2 and self.y <= p.y <= self.y2
+
+    def union(self, other: "Rect") -> "Rect":
+        x  = min(self.x,  other.x)
+        y  = min(self.y,  other.y)
+        x2 = max(self.x2, other.x2)
+        y2 = max(self.y2, other.y2)
+        return Rect(x, y, x2 - x, y2 - y)
+
+    def __repr__(self):
+        return f"Rect(x={self.x:.0f}, y={self.y:.0f}, w={self.width:.0f}, h={self.height:.0f})"
+
+
+@dataclass
+class ColorSample:
+    r: int
+    g: int
+    b: int
+    a: int = 255
+
+    @property
+    def luminance(self) -> float:
+        def _linearize(c):
+            c /= 255.0
+            return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+        return 0.2126 * _linearize(self.r) + 0.7152 * _linearize(self.g) + 0.0722 * _linearize(self.b)
+
+    @property
+    def is_dark(self) -> bool:
+        return self.luminance < 0.18
+
+    @property
+    def hex(self) -> str:
+        return f"#{self.r:02X}{self.g:02X}{self.b:02X}"
+
+    @property
+    def hsl(self):
+        h, l, s = colorsys.rgb_to_hls(self.r / 255, self.g / 255, self.b / 255)
+        return round(h * 360, 1), round(s * 100, 1), round(l * 100, 1)
+
+    def contrast_ratio(self, other: "ColorSample") -> float:
+        l1 = max(self.luminance, other.luminance) + 0.05
+        l2 = min(self.luminance, other.luminance) + 0.05
+        return l1 / l2
+
+    def __repr__(self):
+        return f"ColorSample({self.hex}, α={self.a})"
+
+
+# ── screen reader ─────────────────────────────────────────────────────────────
+
+class ScreenBuffer:
+    """Thin abstraction over a captured screen region."""
+
+    def __init__(self, width: int, height: int, raw_bytes: Optional[bytes] = None):
+        self.width  = width
+        self.height = height
+        self._data  = raw_bytes or bytes(width * height * 4)
+        self._cache: dict = {}
+        self._dirty = True
+        self._capture_ts = time.monotonic()
+
+    @property
+    def stride(self) -> int:
+        return self.width * 4
+
+    def pixel_at(self, x: int, y: int) -> ColorSample:
+        if not (0 <= x < self.width and 0 <= y < self.height):
+            return ColorSample(0, 0, 0, 0)
+        key = (x, y)
+        if key in self._cache:
+            return self._cache[key]
+        idx = (y * self.width + x) * 4
+        r, g, b, a = self._data[idx], self._data[idx+1], self._data[idx+2], self._data[idx+3]
+        sample = ColorSample(r, g, b, a)
+        self._cache[key] = sample
+        return sample
+
+    def sample_region(self, rect: Rect) -> list:
+        samples = []
+        step = max(1, int(COLOR_SAMPLE_RADIUS))
+        for y in range(int(rect.y), int(rect.y2), step):
+            for x in range(int(rect.x), int(rect.x2), step):
+                samples.append(self.pixel_at(x, y))
+        return samples
+
+    def dominant_color(self, rect: Rect) -> ColorSample:
+        samples = self.sample_region(rect)
+        if not samples:
+            return ColorSample(0, 0, 0)
+        r = sum(s.r for s in samples) // len(samples)
+        g = sum(s.g for s in samples) // len(samples)
+        b = sum(s.b for s in samples) // len(samples)
+        return ColorSample(r, g, b)
+
+    def row_entropy(self, y: int) -> float:
+        if y < 0 or y >= self.height:
+            return 0.0
+        buckets = [0] * 16
+        for x in range(0, self.width, 4):
+            p = self.pixel_at(x, y)
+            bucket = (p.r >> 4) ^ (p.g >> 5) ^ (p.b >> 4)
+            buckets[bucket % 16] += 1
+        total = sum(buckets)
+        if total == 0:
+            return 0.0
+        entropy = 0.0
+        for count in buckets:
+            if count:
+                p = count / total
+                entropy -= p * math.log2(p)
+        return entropy
+
+    def checksum(self) -> str:
+        return hashlib.md5(self._data[:4096]).hexdigest()[:8]
+
+    def stale(self, max_age: float = 0.033) -> bool:
+        return (time.monotonic() - self._capture_ts) > max_age
+
+
+class ScreenReader:
+    """Scans a ScreenBuffer to locate UI regions and extract text hints."""
+
+    def __init__(self, mode: ScanMode = ScanMode.NORMAL):
+        self.mode     = mode
+        self._regions: list["UIRegion"] = []
+        self._last_checksum = ""
+        self._scan_count    = 0
+        self._row_skip = {"fast": 4, "normal": 1, "precise": 1}[mode.value]
+
+    def scan(self, buffer: ScreenBuffer) -> list["UIRegion"]:
+        chk = buffer.checksum()
+        if chk == self._last_checksum and self._regions:
+            return self._regions        # no change, return cached
+
+        self._last_checksum = chk
+        self._scan_count += 1
+        self._regions = []
+
+        run_start: Optional[int] = None
+        prev_entropy = 0.0
+
+        for y in range(0, min(buffer.height, MAX_SCAN_ROWS), self._row_skip):
+            entropy = buffer.row_entropy(y)
+            delta   = abs(entropy - prev_entropy)
+
+            if delta > 1.2 and run_start is None:
+                run_start = y
+            elif delta < 0.3 and run_start is not None:
+                height = y - run_start
+                if height > 4:
+                    rect   = Rect(0, run_start, buffer.width, height)
+                    color  = buffer.dominant_color(rect)
+                    region = UIRegion(rect=rect, background=color)
+                    self._regions.append(region)
+                run_start = None
+
+            prev_entropy = entropy
+
+        _assign_roles(self._regions, buffer)
+        return self._regions
+
+    def find_element(self, role: ElementRole,
+                     hint: Optional[str] = None) -> Optional["UIRegion"]:
+        for region in self._regions:
+            if region.role == role:
+                if hint is None or (region.label and hint.lower() in region.label.lower()):
+                    return region
+        return None
+
+    def elements_in_rect(self, rect: Rect) -> list["UIRegion"]:
+        return [r for r in self._regions if r.rect.intersects(rect)]
+
+    def reading_order(self) -> list["UIRegion"]:
+        return sorted(self._regions, key=lambda r: (round(r.rect.y / LAYOUT_SNAP_THRESHOLD),
+                                                    r.rect.x))
+
+    def stats(self) -> dict:
+        return {
+            "scan_count":   self._scan_count,
+            "region_count": len(self._regions),
+            "mode":         self.mode.value,
+            "last_chk":     self._last_checksum,
+        }
+
+
+# ── UI elements ───────────────────────────────────────────────────────────────
+
+@dataclass
+class UIRegion:
+    rect:       Rect
+    background: ColorSample           = field(default_factory=lambda: ColorSample(255, 255, 255))
+    role:       ElementRole           = ElementRole.UNKNOWN
+    label:      Optional[str]         = None
+    confidence: float                 = 0.0
+    children:   list["UIRegion"]      = field(default_factory=list)
+    _meta:      dict                  = field(default_factory=dict, repr=False)
+
+    @property
+    def center(self) -> Point:
+        return self.rect.anchor(AnchorPoint.CENTER)
+
+    @property
+    def is_interactive(self) -> bool:
+        return self.role in (ElementRole.BUTTON, ElementRole.INPUT,
+                             ElementRole.CHECKBOX, ElementRole.DROPDOWN)
+
+    @property
+    def wcag_level(self) -> str:
+        bg   = self.background
+        fg   = self._meta.get("foreground", ColorSample(0, 0, 0))
+        ratio = bg.contrast_ratio(fg)
+        if ratio >= 7.0:    return "AAA"
+        if ratio >= 4.5:    return "AA"
+        if ratio >= 3.0:    return "AA-large"
+        return "FAIL"
+
+    def relative_to(self, origin: Point) -> Rect:
+        return Rect(self.rect.x - origin.x, self.rect.y - origin.y,
+                    self.rect.width, self.rect.height)
+
+    def alignment_offset(self, other: "UIRegion", axis: Axis) -> float:
+        if axis == Axis.HORIZONTAL:
+            return self.rect.cy - other.rect.cy
+        if axis == Axis.VERTICAL:
+            return self.rect.cx - other.rect.cx
+        return math.hypot(self.rect.cx - other.rect.cx, self.rect.cy - other.rect.cy)
+
+    def __repr__(self):
+        lbl = f" '{self.label}'" if self.label else ""
+        return f"UIRegion({self.role.value}{lbl}, {self.rect})"
+
+
+def _assign_roles(regions: list[UIRegion], buffer: ScreenBuffer):
+    for region in regions:
+        w, h   = region.rect.width, region.rect.height
+        aspect = region.rect.aspect_ratio
+        lum    = region.background.luminance
+
+        if 24 <= h <= 40 and 60 <= w <= 220 and 0.9 < aspect < 8.0:
+            region.role       = ElementRole.BUTTON
+            region.confidence = 0.78
+        elif h <= 20 and w > 80:
+            region.role       = ElementRole.LABEL
+            region.confidence = 0.65
+        elif 28 <= h <= 36 and w > 100 and lum > 0.85:
+            region.role       = ElementRole.INPUT
+            region.confidence = 0.72
+        elif 14 <= h <= 20 and 14 <= w <= 20:
+            region.role       = ElementRole.CHECKBOX
+            region.confidence = 0.81
+        elif h > 200 and w > 300:
+            region.role       = ElementRole.CONTAINER
+            region.confidence = 0.55
+        elif aspect > 6 and h > 100:
+            region.role       = ElementRole.SCROLLBAR
+            region.confidence = 0.88
+
+
+# ── report builder ────────────────────────────────────────────────────────────
+
+class ReportSection:
+    def __init__(self, title: str, level: int = 1):
+        self.title    = title
+        self.level    = level
+        self._entries: list[Union[str, "ReportSection", "ReportTable"]] = []
+        self._ts      = time.monotonic()
+
+    def add_text(self, text: str) -> "ReportSection":
+        self._entries.append(text)
+        return self
+
+    def add_section(self, title: str, level: Optional[int] = None) -> "ReportSection":
+        sub = ReportSection(title, level or self.level + 1)
+        self._entries.append(sub)
+        return sub
+
+    def add_table(self, headers: list[str]) -> "ReportTable":
+        tbl = ReportTable(headers)
+        self._entries.append(tbl)
+        return tbl
+
+    def render(self, indent: int = 0) -> str:
+        pad    = REPORT_INDENT * indent
+        prefix = "#" * self.level
+        lines  = [f"{pad}{prefix} {self.title}"]
+        for entry in self._entries:
+            if isinstance(entry, str):
+                lines.append(f"{pad}{entry}")
+            elif isinstance(entry, (ReportSection, ReportTable)):
+                lines.append(entry.render(indent + 1))
+        return "\n".join(lines)
+
+    def entry_count(self) -> int:
+        total = 0
+        for e in self._entries:
+            if isinstance(e, ReportSection):
+                total += e.entry_count()
+            elif isinstance(e, ReportTable):
+                total += len(e._rows)
+            else:
+                total += 1
+        return total
+
+
+class ReportTable:
+    def __init__(self, headers: list[str]):
+        self.headers = headers
+        self._rows: list[list[str]] = []
+        self._col_widths = [len(h) for h in headers]
+
+    def add_row(self, *values) -> "ReportTable":
+        row = [str(v) for v in values]
+        for i, val in enumerate(row):
+            if i < len(self._col_widths):
+                self._col_widths[i] = max(self._col_widths[i], len(val))
+        self._rows.append(row)
+        return self
+
+    def render(self, indent: int = 0) -> str:
+        pad  = REPORT_INDENT * indent
+        sep  = "  ".join("-" * w for w in self._col_widths)
+        head = "  ".join(h.ljust(self._col_widths[i]) for i, h in enumerate(self.headers))
+        lines = [f"{pad}{head}", f"{pad}{sep}"]
+        for row in self._rows:
+            cells = "  ".join((row[i] if i < len(row) else "").ljust(self._col_widths[i])
+                               for i in range(len(self.headers)))
+            lines.append(f"{pad}{cells}")
+        return "\n".join(lines)
+
+    def sort_by(self, col_index: int, reverse: bool = False) -> "ReportTable":
+        try:
+            self._rows.sort(key=lambda r: r[col_index] if col_index < len(r) else "",
+                            reverse=reverse)
+        except Exception:
+            pass
+        return self
+
+    def filter_rows(self, col_index: int, value: str) -> list[list[str]]:
+        return [r for r in self._rows if col_index < len(r) and value in r[col_index]]
+
+
+class Report:
+    def __init__(self, title: str, author: str = "ScreenAudit"):
+        self.title    = title
+        self.author   = author
+        self._created = time.time()
+        self._sections: list[ReportSection] = []
+        self._metadata: dict = {}
+
+    def add_section(self, title: str) -> ReportSection:
+        sec = ReportSection(title, level=1)
+        self._sections.append(sec)
+        return sec
+
+    def set_meta(self, key: str, value) -> "Report":
+        self._metadata[key] = value
+        return self
+
+    def render(self) -> str:
+        header = [
+            f"# {self.title}",
+            f"Author : {self.author}",
+            f"Sections: {len(self._sections)}",
+            "",
+        ]
+        body = []
+        for sec in self._sections:
+            body.append(sec.render())
+            body.append("")
+        return "\n".join(header + body)
+
+    def total_entries(self) -> int:
+        return sum(s.entry_count() for s in self._sections)
+
+
+# ── layout analysis ───────────────────────────────────────────────────────────
+
+class LayoutAnalyzer:
+    """Derives structural layout information from a set of UIRegions."""
+
+    def __init__(self, screen_rect: Rect):
+        self.screen_rect  = screen_rect
+        self._grid_cols   = 12
+        self._col_width   = screen_rect.width / self._grid_cols
+        self._baselines:  list[float] = []
+        self._flow_zones: list[Rect]  = []
+
+    def col_span(self, rect: Rect) -> tuple[int, int]:
+        start = int(rect.x / self._col_width)
+        end   = math.ceil(rect.x2 / self._col_width)
+        return start, end
+
+    def detect_baselines(self, regions: list[UIRegion]) -> list[float]:
+        ys = sorted(set(round(r.rect.cy / LAYOUT_SNAP_THRESHOLD) * LAYOUT_SNAP_THRESHOLD
+                        for r in regions))
+        merged: list[float] = []
+        for y in ys:
+            if not merged or abs(y - merged[-1]) > LAYOUT_SNAP_THRESHOLD * 2:
+                merged.append(y)
+        self._baselines = merged
+        return merged
+
+    def group_by_row(self, regions: list[UIRegion]) -> dict[int, list[UIRegion]]:
+        rows: dict[int, list[UIRegion]] = {}
+        for region in regions:
+            bl = self._nearest_baseline(region.rect.cy)
+            rows.setdefault(bl, []).append(region)
+        for bl in rows:
+            rows[bl].sort(key=lambda r: r.rect.x)
+        return rows
+
+    def _nearest_baseline(self, cy: float) -> int:
+        if not self._baselines:
+            return int(cy)
+        return int(min(self._baselines, key=lambda b: abs(b - cy)))
+
+    def compute_flow_zones(self, regions: list[UIRegion]) -> list[Rect]:
+        containers = [r for r in regions if r.role == ElementRole.CONTAINER]
+        self._flow_zones = [c.rect for c in containers]
+        return self._flow_zones
+
+    def detect_symmetry(self, regions: list[UIRegion], axis: Axis) -> float:
+        if not regions:
+            return 0.0
+        cx = self.screen_rect.cx
+        cy = self.screen_rect.cy
+        scores = []
+        for r in regions:
+            if axis == Axis.VERTICAL:
+                mirror_x = 2 * cx - r.rect.cx
+                nearest  = min((o for o in regions if o is not r),
+                               key=lambda o: abs(o.rect.cx - mirror_x), default=None)
+                if nearest:
+                    scores.append(1.0 - min(abs(nearest.rect.cx - mirror_x) / cx, 1.0))
+            else:
+                mirror_y = 2 * cy - r.rect.cy
+                nearest  = min((o for o in regions if o is not r),
+                               key=lambda o: abs(o.rect.cy - mirror_y), default=None)
+                if nearest:
+                    scores.append(1.0 - min(abs(nearest.rect.cy - mirror_y) / cy, 1.0))
+        return sum(scores) / len(scores) if scores else 0.0
+
+    def generate_report(self, regions: list[UIRegion]) -> Report:
+        report = Report("Layout Analysis Report")
+        report.set_meta("screen", f"{self.screen_rect.width}x{self.screen_rect.height}")
+        report.set_meta("regions_analyzed", len(regions))
+
+        overview = report.add_section("Overview")
+        overview.add_text(f"Total UI regions detected : {len(regions)}")
+        overview.add_text(f"Screen dimensions         : {self.screen_rect.width:.0f}x{self.screen_rect.height:.0f}px")
+        overview.add_text(f"Grid columns              : {self._grid_cols}")
+
+        by_role: dict[str, list[UIRegion]] = {}
+        for r in regions:
+            by_role.setdefault(r.role.value, []).append(r)
+
+        roles_sec = report.add_section("Element Breakdown")
+        tbl = roles_sec.add_table(["Role", "Count", "Avg Width", "Avg Height", "Avg Confidence"])
+        for role_name, group in sorted(by_role.items()):
+            avg_w    = sum(r.rect.width  for r in group) / len(group)
+            avg_h    = sum(r.rect.height for r in group) / len(group)
+            avg_conf = sum(r.confidence  for r in group) / len(group)
+            tbl.add_row(role_name, len(group), f"{avg_w:.1f}", f"{avg_h:.1f}", f"{avg_conf:.2f}")
+
+        baselines = self.detect_baselines(regions)
+        layout_sec = report.add_section("Layout Structure")
+        layout_sec.add_text(f"Detected baselines: {len(baselines)}")
+
+        rows = self.group_by_row(regions)
+        row_tbl = layout_sec.add_table(["Baseline Y", "Elements", "Roles"])
+        for bl, row_regions in sorted(rows.items()):
+            roles = ", ".join(sorted(set(r.role.value for r in row_regions)))
+            row_tbl.add_row(f"{bl}px", len(row_regions), roles)
+
+        access_sec = report.add_section("Accessibility")
+        wcag_tbl   = access_sec.add_table(["Region", "Role", "WCAG Level", "Contrast Ratio"])
+        for r in regions:
+            bg  = r.background
+            fg  = r._meta.get("foreground", ColorSample(0, 0, 0))
+            cr  = round(bg.contrast_ratio(fg), 2)
+            wcag_tbl.add_row(str(r.rect), r.role.value, r.wcag_level, cr)
+
+        sym_v = self.detect_symmetry(regions, Axis.VERTICAL)
+        sym_h = self.detect_symmetry(regions, Axis.HORIZONTAL)
+        sym_sec = report.add_section("Symmetry Analysis")
+        sym_sec.add_text(f"Vertical   symmetry score : {sym_v:.3f}")
+        sym_sec.add_text(f"Horizontal symmetry score : {sym_h:.3f}")
+
+        return report
+
+
+# ── coordinate utilities ──────────────────────────────────────────────────────
+
+class CoordinateMapper:
+    """Converts between screen-space, window-space, and logical units."""
+
+    def __init__(self, screen_rect: Rect, window_rect: Rect, dpi_scale: float = 1.0):
+        self._screen  = screen_rect
+        self._window  = window_rect
+        self._scale   = dpi_scale
+        self._offset  = Point(window_rect.x - screen_rect.x,
+                              window_rect.y - screen_rect.y)
+        self._history: list[tuple[Point, Point]] = []
+
+    def screen_to_window(self, p: Point) -> Point:
+        result = Point((p.x - self._window.x) / self._scale,
+                       (p.y - self._window.y) / self._scale)
+        self._history.append((p, result))
+        return result
+
+    def window_to_screen(self, p: Point) -> Point:
+        result = Point(p.x * self._scale + self._window.x,
+                       p.y * self._scale + self._window.y)
+        self._history.append((p, result))
+        return result
+
+    def normalize(self, p: Point) -> Point:
+        return Point(p.x / self._screen.width, p.y / self._screen.height)
+
+    def denormalize(self, p: Point) -> Point:
+        return Point(p.x * self._screen.width, p.y * self._screen.height)
+
+    def pt_to_px(self, pt: float) -> float:
+        return pt * (SCREEN_DPI / 72.0) * self._scale
+
+    def px_to_pt(self, px: float) -> float:
+        return px / (SCREEN_DPI / 72.0) / self._scale
+
+    def region_in_window(self, region: UIRegion) -> Rect:
+        tl = self.screen_to_window(region.rect.anchor(AnchorPoint.TOP_LEFT))
+        br = self.screen_to_window(region.rect.anchor(AnchorPoint.BOT_RIGHT))
+        return Rect(tl.x, tl.y, br.x - tl.x, br.y - tl.y)
+
+    def clear_history(self):
+        self._history.clear()
+
+    def last_mapping(self) -> Optional[tuple[Point, Point]]:
+        return self._history[-1] if self._history else None
+
+
+# ── entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    screen_rect = Rect(0, 0, 1920, 1080)
+    window_rect = Rect(100, 50, 1720, 980)
+
+    buffer   = ScreenBuffer(1920, 1080)
+    reader   = ScreenReader(mode=ScanMode.NORMAL)
+    regions  = reader.scan(buffer)
+
+    analyzer = LayoutAnalyzer(screen_rect)
+    report   = analyzer.generate_report(regions)
+
+    mapper   = CoordinateMapper(screen_rect, window_rect, dpi_scale=1.5)
+    origin   = Point(screen_rect.cx, screen_rect.cy)
+
+    btn = reader.find_element(ElementRole.BUTTON, hint="submit")
+    if btn:
+        win_pos = mapper.region_in_window(btn)
+        rel_pos = btn.relative_to(origin)
