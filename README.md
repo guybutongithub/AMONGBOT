@@ -15,6 +15,10 @@ For imposters:
 3. Is there a crewmate dead body near you AND another crewmate? Yes: Go to and report it, give information on where it was and who was near during the meeting to not look sus. No: Continue through list.
 4. Are sabatoges/abilities off cooldown? Yes: use abilities like shapeshift and phantom when no one is looking and/or sabatoge something. No: Roam or check cams/admin.
 
+# How Does Chat Work?
+ChatGPT magic. IDK
+
+
 # Is this a joke?
 AMONGBOT is not not not a joke bot thats fake on opposite day.
 
